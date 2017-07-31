@@ -20,8 +20,13 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Random;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.apache.http.impl.client.HttpClientBuilder;
+import org.jboss.jbossts.star.util.TxStatus;
+import org.jboss.jbossts.star.util.TxSupport;
 
 import com.github.kennedyoliveira.hystrix.contrib.vertx.metricsstream.EventMetricsStreamHandler;
 
@@ -88,6 +93,9 @@ public class AlohaVerticle extends AbstractVerticle {
             .putHeader("Content-Type", "application/json")
             .end(Json.encode(list))));
 
+        router.head("/api/:pid/participant").handler(ctx -> txnParticipant(ctx));
+        router.put("/api/:pid/terminator").handler(ctx -> txnTerminator(ctx));
+
 
         // Hystrix Stream Endpoint
         router.get(EventMetricsStreamHandler.DEFAULT_HYSTRIX_PREFIX).handler(EventMetricsStreamHandler.createHandler());
@@ -105,18 +113,72 @@ public class AlohaVerticle extends AbstractVerticle {
     }
 
     private void alohaChaining(RoutingContext context, Handler<List<String>> resultHandler) {
-        vertx.<String> executeBlocking(
+        String tmEnlistUri = context.request().getParam("tmEnlistUri");
+        vertx.<List<String>> executeBlocking(
             // Invoke the service in a worker thread, as it's blocking.
-            future -> future.complete(getNextService(context).bonjour()),
+            future -> {
+                String participantUid = Integer.toString(new Random().nextInt(Integer.MAX_VALUE) + 1);
+                String header = new TxSupport().makeTwoPhaseAwareParticipantLinkHeader("http://aloha:8080/api", /*volatile*/ false, participantUid, null);
+                System.out.println("Enlistment uri: " + tmEnlistUri + ", header :" + header);
+                String participant = new TxSupport().enlistParticipant(tmEnlistUri, header);
+                System.out.println("Enlisted participant url: " + participant);
+
+                List<String> greetings = new ArrayList<>();
+                greetings.add(aloha());
+                greetings.add(getNextService(context).bonjour(tmEnlistUri));
+                future.complete(greetings);
+            },
             ar -> {
                 // Back to the event loop
                 // result cannot be null, hystrix would have called the fallback.
-                String result = ar.result();
-                List<String> greetings = new ArrayList<>();
-                greetings.add(aloha());
-                greetings.add(result);
+                List<String> greetings = ar.result();
                 resultHandler.handle(greetings);
             });
+    }
+    
+    private void txnParticipant(RoutingContext ctx) {
+        String pid = ctx.request().getParam("pid");
+        String uri = ctx.request().absoluteURI();
+
+        vertx.<String> executeBlocking(future ->
+        {
+            System.out.println("pid:" + pid + ", " + uri);
+            Pattern pattern = Pattern.compile("^(.*/api/)", Pattern.CASE_INSENSITIVE);
+            Matcher matcher = pattern.matcher(uri);
+            matcher.find();
+            try {
+                String linkHeader = new TxSupport().makeTwoPhaseAwareParticipantLinkHeader(matcher.group(1), false, pid, null);
+                System.out.println("Asked to get participant terminator info - returning: " + linkHeader);
+                future.complete(linkHeader);
+            } catch (Throwable t) {
+                t.printStackTrace();
+                future.fail("error");
+            }
+        },
+        result -> {
+            ctx.response()
+                .putHeader("Content-type", "text/plain");
+            if (!result.failed()) ctx.response().putHeader("Link", result.result());
+            ctx.response().end();
+        });
+    }
+    
+    private void txnTerminator(RoutingContext ctx) {
+        String pid = ctx.request().getParam("pid");
+        TxStatus status = TxSupport.toTxStatus(ctx.getBodyAsString());
+        System.out.println("For pid " + pid + ", status: " + status);
+
+        if (status.isPrepare()) {
+            System.out.println("Service: preparing");
+        } else if (status.isCommit()) {
+            System.out.println("Service: committing");
+        } else if (status.isAbort()) {
+            System.out.println("Service: aborting");
+        } else {
+            ctx.fail(400);
+        }
+        
+        ctx.response().end();
     }
 
     /**
@@ -134,7 +196,7 @@ public class AlohaVerticle extends AbstractVerticle {
             .requestInterceptor((t) -> DefaultSpanManager.getInstance().activate(serverSpan))
             .logger(new Logger.ErrorLogger()).logLevel(Level.BASIC)
             .target(BonjourService.class, "http://bonjour:8080/",
-                () -> "Bonjour response (fallback)");
+                (String tmEnlistUri) -> "Bonjour response (fallback)");
     }
 
 }

@@ -16,11 +16,12 @@
  */
 package com.redhat.developers.msa.aloha;
 
+import feign.Param;
 import feign.RequestLine;
 
 public interface BonjourService {
 
-	@RequestLine("GET /api/bonjour")
-	public String bonjour();
+	@RequestLine("GET /api/bonjour?tmEnlistUri={tmEnlistUri}")
+	public String bonjour(@Param("tmEnlistUri") String tmEnlistUri);
 
 }

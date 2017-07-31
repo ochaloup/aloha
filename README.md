@@ -21,3 +21,18 @@ Deploy the application in Openshift using Fabric8 plugin
 2. Execute
 
 		mvn clean package docker:build fabric8:json fabric8:apply
+
+
+ochaloup notes
+--------------
+
+```
+  Here we go with
+    * `mvn package && oc start-build aloha --from-dir=. --follow`
+
+  To check how that works
+    * `curl -X GET http://aloha-helloworld-msa-restat.192.168.99.100.nip.io/api/aloha-chaining`
+
+  Usable commands
+    * `oc logs -f `oc get pods | grep ^aloha | grep Running | awk '{ print $1 }'``
+```

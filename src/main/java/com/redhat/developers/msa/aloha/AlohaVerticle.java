@@ -16,10 +16,13 @@
  */
 package com.redhat.developers.msa.aloha;
 
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.apache.http.impl.client.HttpClientBuilder;
 
@@ -30,14 +33,19 @@ import feign.Logger.Level;
 import feign.httpclient.ApacheHttpClient;
 import feign.hystrix.HystrixFeign;
 import feign.opentracing.TracingClient;
+import io.narayana.lra.annotation.CompensatorStatus;
+import io.narayana.lra.client.LRAClient;
 import io.opentracing.Span;
 import io.opentracing.Tracer;
 import io.opentracing.contrib.spanmanager.DefaultSpanManager;
 import io.vertx.core.AbstractVerticle;
+import io.vertx.core.Future;
 import io.vertx.core.Handler;
 import io.vertx.core.http.HttpMethod;
+import io.vertx.core.impl.FutureFactoryImpl;
 import io.vertx.core.json.Json;
 import io.vertx.core.json.JsonObject;
+import io.vertx.core.spi.FutureFactory;
 import io.vertx.ext.auth.User;
 import io.vertx.ext.auth.jwt.JWTAuth;
 import io.vertx.ext.web.Router;
@@ -50,6 +58,8 @@ import io.vertx.ext.web.handler.StaticHandler;
 public class AlohaVerticle extends AbstractVerticle {
 
     private static Tracer tracer = TracingConfiguration.tracer;
+    private static String coordinatorHost = System.getProperty(LRAClient.CORRDINATOR_HOST_PROP, "lra-coordinator");
+    private static Integer coordinatorPort = Integer.getInteger(LRAClient.CORRDINATOR_PORT_PROP, 8080);
 
     @Override
     public void start() throws Exception {
@@ -67,7 +77,9 @@ public class AlohaVerticle extends AbstractVerticle {
             .allowedHeader("Origin, X-Requested-With, Content-Type, Accept, Authorization"));
 
         // Aloha EndPoint
-        router.get("/api/aloha").handler(ctx -> ctx.response().end(aloha()));
+        // router.get("/api/aloha").handler(ctx -> ctx.response().end(aloha()));
+        router.get("/api/aloha").handler(ctx -> aloha(ctx, (string) -> ctx.response()
+                .end(string)));
 
         String keycloackServer = System.getenv("KEYCLOAK_AUTH_SERVER_URL");
 
@@ -88,6 +100,9 @@ public class AlohaVerticle extends AbstractVerticle {
             .putHeader("Content-Type", "application/json")
             .end(Json.encode(list))));
 
+        router.put("/api/complete").handler(ctx -> complete(ctx));
+        router.put("/api/compensate").handler(ctx -> compensate(ctx));
+        router.get("/api/status").handler(ctx -> status(ctx));
 
         // Hystrix Stream Endpoint
         router.get(EventMetricsStreamHandler.DEFAULT_HYSTRIX_PREFIX).handler(EventMetricsStreamHandler.createHandler());
@@ -95,28 +110,125 @@ public class AlohaVerticle extends AbstractVerticle {
         // Static content
         router.route("/*").handler(StaticHandler.create());
 
-        vertx.createHttpServer().requestHandler(router::accept).listen(8080);
-        System.out.println("Service running at 0.0.0.0:8080");
+        Integer port = Integer.getInteger("http.port", 8080);
+        vertx.createHttpServer().requestHandler(router::accept).listen(port);
+        System.out.println("Service running at 0.0.0.0:" + port);
+    }
+
+    private void aloha(RoutingContext ctx, Handler<String> resultHandler) {
+        vertx.<String> executeBlocking(
+            future -> {
+            	boolean joint = joinLRA(ctx);
+
+            	String alohaGreetings = aloha();
+            	if(!joint) alohaGreetings += " (failed)"; 
+
+                future.complete(alohaGreetings);
+            },
+            ar -> {
+                // Back to the event loop
+                String greetings = ar.result();
+                resultHandler.handle(greetings);
+            });
     }
 
     private String aloha() {
-        String hostname = System.getenv().getOrDefault("HOSTNAME", "unknown");
-        return String.format("Aloha mai %s", hostname);
+    	String hostname = System.getenv().getOrDefault("HOSTNAME", "unknown");
+    	return String.format("Aloha mai %s", hostname);
+    	
     }
 
-    private void alohaChaining(RoutingContext context, Handler<List<String>> resultHandler) {
-        vertx.<String> executeBlocking(
+    private void alohaChaining(RoutingContext ctx, Handler<List<String>> resultHandler) {
+    	String lraUri = getLraId(ctx);
+
+        vertx.<List<String>> executeBlocking(
             // Invoke the service in a worker thread, as it's blocking.
-            future -> future.complete(getNextService(context).bonjour()),
+            future -> {
+            	boolean joint = joinLRA(ctx);
+            	List<String> greetings = new ArrayList<>();
+
+            	String alohaGreeting = aloha();
+            	if(!joint) alohaGreeting += " (failed)"; 
+            	
+            	greetings.add(alohaGreeting);
+            	greetings.add(getNextService(ctx).bonjour(lraUri));
+
+                future.complete(greetings);
+            },
             ar -> {
                 // Back to the event loop
                 // result cannot be null, hystrix would have called the fallback.
-                String result = ar.result();
-                List<String> greetings = new ArrayList<>();
-                greetings.add(aloha());
-                greetings.add(result);
+                List<String> greetings = ar.result();
+                // System.out.println("Passing back to caller: " + greetings);
                 resultHandler.handle(greetings);
             });
+    }
+
+    private boolean joinLRA(RoutingContext ctx) {
+        String lraUri = getLraId(ctx);
+        String baseUri = getBaseUri(ctx.request().absoluteURI());
+
+        System.out.printf("Joining LRA '%s' with baseUri '%s' on coordinator '%s:%s'%n",
+                lraUri, baseUri, coordinatorHost, coordinatorPort);
+
+        try (LRAClient lraClient = new LRAClient(coordinatorHost, coordinatorPort)) {
+            String recoveryPath = lraClient.joinLRA(new URL(lraUri), 0L, baseUri, null);
+            // System.out.println("Recovery path of the enlisted resource is: " + recoveryPath);
+        } catch (Exception e) {
+            System.err.printf("Can't join LRA %s, %s:%s", lraUri, e.getClass(), e.getMessage());
+            e.printStackTrace();
+            return false;
+        }
+        return true;
+    }
+
+    private String getLraId(RoutingContext ctx) {
+    	String lraHeader = ctx.request().getHeader(LRAClient.LRA_HTTP_HEADER);
+    	if(lraHeader == null) lraHeader = ctx.request().getHeader(LRAClient.LRA_HTTP_HEADER.toLowerCase());
+    	return lraHeader;
+    }
+
+    private void complete(RoutingContext ctx) {
+        String lraId = sendResponse(ctx, "complete");
+        System.out.printf("I was happy to say 'aloha' [%s completed]%n", lraId);
+        ctx.response().end();
+    }
+    
+    private void compensate(RoutingContext ctx) {
+        String lraId= sendResponse(ctx, "compensate");
+        System.out.printf("I'm sorry, I didn't mean the greetings 'aloha'. I'm taking it back [%s compensated]%n", lraId);
+        ctx.response().end();
+    }
+
+    private void status(RoutingContext ctx) {
+        sendResponse(ctx, "status");
+        ctx.response().end(Json.encodePrettily(CompensatorStatus.Completed));
+    }
+
+    private String getBaseUri(String absUri) {
+        Pattern pattern = Pattern.compile("^(.*/api).*", Pattern.CASE_INSENSITIVE);
+        Matcher matcher = pattern.matcher(absUri);
+
+        String baseUri;
+        if(matcher.find()) {
+            baseUri = matcher.group(1);
+        } else {
+            baseUri = absUri;
+        }
+        return baseUri;
+    }
+
+    private String sendResponse(final RoutingContext ctx, String endpointString) {
+        String lraUri = ctx.request().getHeader(LRAClient.LRA_HTTP_HEADER);
+        String uri = ctx.request().absoluteURI();
+        String baseUri = getBaseUri(uri);
+        
+        String txId = LRAClient.getLRAId(lraUri);
+        String responseUrl = String.format("%s/%s/%s", baseUri, txId, endpointString);
+
+        ctx.response().putHeader("Content-type", "application/json; charset=utf-8");
+        ctx.response().putHeader("Link", responseUrl);
+        return lraUri;
     }
 
     /**
@@ -127,14 +239,19 @@ public class AlohaVerticle extends AbstractVerticle {
      */
     private BonjourService getNextService(RoutingContext context) {
         final Span serverSpan = context.get(TracingConfiguration.ACTIVE_SPAN);
+
+        String host = System.getProperty("bonjour.host", "bonjour");
+        String port = System.getProperty("bonjour.port", "8080");
+        System.out.println(">>> Bonjour service expected being at " + host + ":" + port);
+        
         return HystrixFeign.builder()
             // Use apache HttpClient which contains the ZipKin Interceptors
             .client(new TracingClient(new ApacheHttpClient(HttpClientBuilder.create().build()), tracer))
             // bind span to current thread
             .requestInterceptor((t) -> DefaultSpanManager.getInstance().activate(serverSpan))
             .logger(new Logger.ErrorLogger()).logLevel(Level.BASIC)
-            .target(BonjourService.class, "http://bonjour:8080/",
-                () -> "Bonjour response (fallback)");
+            .target(BonjourService.class, String.format("http://%s:%s/", host, port),
+                (String lraUri) -> "Bonjour response (fallback)");
     }
 
 }

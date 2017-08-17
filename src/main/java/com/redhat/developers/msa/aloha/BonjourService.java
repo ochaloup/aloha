@@ -16,11 +16,15 @@
  */
 package com.redhat.developers.msa.aloha;
 
+import feign.Headers;
+import feign.Param;
 import feign.RequestLine;
+import io.narayana.lra.client.LRAClient;
 
 public interface BonjourService {
 
-	@RequestLine("GET /api/bonjour")
-	public String bonjour();
+    @RequestLine("GET /api/bonjour")
+    @Headers(LRAClient.LRA_HTTP_HEADER + ": {xlra}")
+	public String bonjour(@Param("xlra") String xlra);
 
 }

@@ -93,5 +93,6 @@ public class TracingConfiguration {
                 span.log(errorLogs);
             }
         }
+        routingContext.response().setStatusCode(404).end();
     }
 }
